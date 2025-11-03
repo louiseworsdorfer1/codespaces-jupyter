@@ -1,0 +1,158 @@
+# src/perceel_radius.py
+from pathlib import Path
+import pandas as pd
+import numpy as np
+import requests, re
+from math import radians, sin, cos, sqrt, atan2
+import pgeocode
+
+# ---------- Pad naar data ----------
+ROOT = Path(__file__).resolve().parents[1]
+CSV  = ROOT / "data" / "merged_paardenmest.csv"  
+
+# ---------- Helpers ----------
+def valideer_perceelcode(perceelcode: str) -> bool:
+    # 3-4 letters, spatie, 1 letter, spatie, 4 cijfers (bv: ABC D 1234)
+    patroon = r"^[A-Z]{3,4}\d{0,2}\s[A-Z]\s\d{1,5}$"
+    return bool(re.match(patroon, perceelcode))
+
+def zoek_perceel_coordinaten(perceelcode: str) -> tuple[float, float]:
+    """Haalt lat/lon op van een perceelcode via PDOK. Geeft (lat, lon) terug."""
+    # 1) suggest → id
+    s_url = "https://api.pdok.nl/bzk/locatieserver/search/v3_1/suggest"
+    r = requests.get(s_url, params={"q": perceelcode, "fq": "type:perceel"}, timeout=30)
+    r.raise_for_status()
+    data = r.json()
+    if data["response"]["numFound"] == 0:
+        raise ValueError("Perceel niet gevonden in PDOK (suggest).")
+    perceel_id = data["response"]["docs"][0]["id"]
+
+    # 2) lookup → centroide_ll
+    l_url = "https://api.pdok.nl/bzk/locatieserver/search/v3_1/lookup"
+    r = requests.get(l_url, params={"id": perceel_id}, timeout=30)
+    r.raise_for_status()
+    data = r.json()
+    if data["response"]["numFound"] == 0:
+        raise ValueError("Perceel niet gevonden in PDOK (lookup).")
+    doc = data["response"]["docs"][0]
+
+    # PDOK centroide_ll is: "POINT(lon lat)"
+    m = re.search(r"POINT\s*\(([-\d.]+)\s+([-\d.]+)\)", doc.get("centroide_ll", ""))
+    if not m:
+        raise ValueError("Kon centroide_ll niet parsen.")
+    lon, lat = map(float, m.groups())
+    return lat, lon
+
+def find_column(pattern: str, columns, error_msg: str) -> str:
+    matches = [c for c in columns if pattern in c.lower()]
+    if not matches:
+        raise ValueError(error_msg)
+    return matches[0]
+
+def haversine_km(lat1, lon1, lat2, lon2):
+    """Vectorized haversine. lat2/lon2 mogen numpy-arrays zijn."""
+    R = 6371.0088
+    lat1, lon1 = np.radians(lat1), np.radians(lon1)
+    lat2, lon2 = np.radians(lat2), np.radians(lon2)
+    dlat, dlon = lat2 - lat1, lon2 - lon1
+    a = np.sin(dlat/2.0)**2 + np.cos(lat1) * np.cos(lat2) * np.sin(dlon/2.0)**2
+    return 2 * R * np.arcsin(np.sqrt(a))
+
+# ---------- Main flow ----------
+def run(perceelcode: str, radius_km: float, save_outputs: bool = False):
+    if not valideer_perceelcode(perceelcode):
+        raise ValueError("Perceelcode formaat ongeldig. Voorbeeld: 'ABCD A 1234'.")
+
+    # 1) Origin-coördinaten ophalen
+    o_lat, o_lon = zoek_perceel_coordinaten(perceelcode)
+
+    # 2) Data inlezen
+    df = pd.read_csv(CSV, sep=";", decimal=",", thousands=".")
+
+    # komma→punt voor numerieke kolommen
+    for c in df.columns:
+        if df[c].dtype == object and df[c].astype(str).str.contains(",", na=False).any():
+            df[c] = pd.to_numeric(df[c].astype(str).str.replace(",", ".", regex=False), errors="coerce")
+
+    # 3) Benodigde kolommen vinden
+    postcode_col      = find_column("postcode", df.columns, "Geen postcode-kolom gevonden.")
+    month_col         = find_column("maand", df.columns, "Geen maand-kolom gevonden.")
+    kg_col            = find_column("kg", df.columns, "Geen kolom met kilos gevonden.")
+    laadlocatie_col   = find_column("aantal_laadlocaties", df.columns, "Geen kolom met aantal_laadlocaties gevonden.")
+    provincie_col     = find_column("provincie", df.columns, "Geen provincie-kolom gevonden.")
+
+    df[kg_col] = (
+       df[kg_col]
+       .astype(str)
+       .str.replace(".", "", regex=False)   # verwijder duizendtallen
+       .str.replace(",", ".", regex=False)  # vervang decimaal
+    )
+    df[kg_col] = pd.to_numeric(df[kg_col], errors="coerce")
+
+    # 4) Postcode → PC4
+    df["PC4"] = (
+        df[postcode_col]
+        .astype(str).str.upper()
+        .str.replace(r"\s+", "", regex=True)
+        .str.extract(r"(\d{4})")[0]
+    )
+    df = df.dropna(subset=["PC4"])
+
+    # 5) Coördinaten per PC4 (pgeocode)
+    nomi = pgeocode.Nominatim("NL")
+    pc4_list = df["PC4"].unique().tolist()
+    coords = nomi.query_postal_code(pc4_list)[["postal_code", "latitude", "longitude"]]\
+                 .rename(columns={"postal_code":"PC4"})
+    df = df.merge(coords, on="PC4", how="left")
+    df = df.dropna(subset=["latitude", "longitude"])
+
+    # 6) Afstanden en filter op radius
+    dists = haversine_km(o_lat, o_lon, df["latitude"].values, df["longitude"].values)
+    in_range = df.loc[dists <= radius_km].copy()
+    in_range["afstand_km"] = dists[dists <= radius_km]
+
+    # 7) Aggregaties
+    # unieke laadlocaties en paarden tellen op PC4-niveau (eerste waarde per PC4 optellen)
+    unique_laadlocaties = in_range.groupby("PC4")[laadlocatie_col].first().sum()
+
+    # totals
+    in_range[kg_col] = pd.to_numeric(in_range[kg_col], errors="coerce")
+    total_ton = in_range[kg_col].sum() / 1000
+
+    # per maand
+    in_range[month_col] = pd.to_numeric(in_range[month_col], errors="coerce")
+    per_maand = (
+        in_range.groupby(month_col, as_index=False)[kg_col]
+        .sum()
+        .rename(columns={kg_col: "TOTAAL_KG"})
+        .sort_values(month_col)
+    )
+    per_maand["TOTAAL_TON"] = per_maand["TOTAAL_KG"] / 1000
+    per_maand["TOTAAL_TON"] = per_maand["TOTAAL_TON"].map("{:,.2f}".format)
+
+    # 8) Samenvatting
+    summary = pd.DataFrame({
+        "Locatie":         [f"lat: {o_lat:.6f}, lon: {o_lon:.6f}"],
+        "Perceelnummer":   [perceelcode],
+        "Radius_km":       [radius_km],
+        "Aantal_rijen":    [len(in_range)],
+        "Totaal_ton":      [total_ton],
+        "Aantal_laadlocs": [unique_laadlocaties],
+    })
+
+    # Console-output
+    print(f"\nPostcodes binnen {radius_km:.0f} km van lat: {o_lat:.5f}, lon: {o_lon:.5f}, perceel: {perceelcode}")
+    print(f"Aantal rijen (per maand, 12x): {len(in_range)}")
+    print(f"Totaal ton paardenmest: {total_ton:,.2f}")
+    print(f"Aantal unieke laadlocaties (uniek): {unique_laadlocaties}\n")
+    print("Som per maand (ton):")
+    print(per_maand[[month_col, "TOTAAL_TON"]].to_string(index=False))
+
+    return in_range, summary, per_maand
+
+# ---------- CLI ----------
+if __name__ == "__main__":
+    perceel = input("Perceelcode: ").strip().upper()
+    radius  = float(input("Radius in km: "))
+    run(perceel, radius, save_outputs=False)
+
