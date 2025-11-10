@@ -5,10 +5,15 @@ import numpy as np
 import requests, re
 from math import radians, sin, cos, sqrt, atan2
 import pgeocode
+import folium
+from IPython.display import display
 
 # ---------- Pad naar data ----------
 ROOT = Path(__file__).resolve().parents[1]
-CSV  = ROOT / "data" / "merged_paardenmest.csv"  
+CSV  = ROOT / "data" / "data_afvoerlocaties_2024.csv"  
+
+o_lat_global = None
+o_lon_global = None
 
 # ---------- Helpers ----------
 def valideer_perceelcode(perceelcode: str) -> bool:
@@ -58,16 +63,145 @@ def haversine_km(lat1, lon1, lat2, lon2):
     a = np.sin(dlat/2.0)**2 + np.cos(lat1) * np.cos(lat2) * np.sin(dlon/2.0)**2
     return 2 * R * np.arcsin(np.sqrt(a))
 
+def normalize_pc(s: str) -> str:
+    if not isinstance(s, str):
+        return ""
+    return re.sub(r"\s+", "", s.upper())
+
+def detect_country(pc_clean: str) -> str | None:
+    # NL PC6: 1234AB  | NL PC4: 1234 | DE PLZ: 12345
+    if re.fullmatch(r"\d{4}[A-Z]{2}", pc_clean):
+        return "NL6"
+    if re.fullmatch(r"\d{4}", pc_clean):
+        return "NL4"
+    if re.fullmatch(r"\d{5}", pc_clean):
+        return "DE"
+    return None
+
+#Neem binnen de huidige radius de grootste locaties (per group_key, default PC4) totdat het target (ton/jaar) is gehaald. 
+def top_postcodes_tot_target(in_range: pd.DataFrame, kg_col: str, laadlocatie_col: str, root: Path, group_key: str = "POSTCODE_KEY"):
+    df = in_range.copy()
+    df[kg_col] = pd.to_numeric(df[kg_col], errors="coerce")
+    df[laadlocatie_col] = pd.to_numeric(df[laadlocatie_col], errors="coerce")
+
+    # jaar-aggregatie per PC6/4: som kg, 1x laadlocaties
+    yearly = (
+        df.groupby(group_key, as_index=False)
+          .agg(
+              kg_sum=(kg_col, "sum"),
+              laadlocaties=(laadlocatie_col, "sum"),
+              afstand_km=("afstand_km", "mean"),
+              latitude=("latitude", "mean"),
+              longitude=("longitude", "mean"),
+          )
+          .dropna(subset=["kg_sum"])
+    )
+    yearly["ton"] = yearly["kg_sum"] / 1000.0
+    yearly["laadlocaties"] = yearly["laadlocaties"].fillna(0).astype(float)
+    yearly = yearly.sort_values(["ton", "laadlocaties"], ascending=[False, True]).reset_index(drop=True)
+
+    # sorteer op ton desc (grootste eerst); bij gelijke ton liever minder laadlocaties
+    yearly = yearly.sort_values(["ton", "laadlocaties"], ascending=[False, True]).reset_index(drop=True)
+
+    # target vragen
+    target_ton = float(input("Vul het doel in (ton/jaar) voor de selectie van grootste laadlocaties binnen de radius: ").strip())
+
+    # greedy selectie tot target bereikt
+    picked_rows, cum_ton, cum_loc = [], 0.0, 0
+    for _, r in yearly.iterrows():
+        if cum_ton >= target_ton:
+            break
+        picked_rows.append(r)
+        cum_ton += r["ton"]
+        cum_loc += int(r["laadlocaties"])
+
+    picked = pd.DataFrame(picked_rows)
+
+    print("\n=== Grootste locaties tot target (binnen radius) ===")
+    print(f"Target (ton/jaar):        {target_ton:,.2f}")
+    print(f"Aantal gekozen {group_key}s:   {len(picked)}")
+    print(f"Totaal ton gehaald:       {cum_ton:,.2f}")
+    print(f"Totaal laadlocaties:      {cum_loc}")
+
+    if picked.empty:
+        print("[Info] Geen selectie (controleer target/data).")
+        return picked
+
+    picked = picked.assign(
+        laadlocaties=picked["laadlocaties"].astype(int),
+        ton=picked["ton"].round(2),
+    )
+    picked["cum_ton"] = picked["ton"].cumsum().round(2)
+    picked["cum_laadloc"] = picked["laadlocaties"].cumsum()
+    picked["afstand_km"] = picked["afstand_km"].round(1)
+
+    cols_show = [group_key, "ton", "laadlocaties", "afstand_km", "cum_ton", "cum_laadloc"]
+    print()
+    print(picked[cols_show].to_string(index=False))
+    out_html = (root / "outputs" / "kaart_grootste_locaties.html")
+    out_html.parent.mkdir(parents=True, exist_ok=True)
+    save_map_for_picked(picked, o_lat_global, o_lon_global, out_html)
+
+def save_map_for_picked(picked: pd.DataFrame, o_lat: float, o_lon: float, out_html: Path):
+    """
+    Maak een interactieve kaart met:
+    - blauwe ster: perceelpunt
+    - rode stippen: geselecteerde POSTCODE_KEYs
+    """
+    if picked.empty or {"latitude", "longitude"}.isdisjoint(picked.columns):
+        print("[Info] Geen coordinaten in 'picked' om te plotten.")
+        return
+
+    # Kaart centreren op perceel
+    m = folium.Map(location=[o_lat, o_lon], zoom_start=7, control_scale=True)
+
+    # Perceel markeren
+    folium.Marker(
+        [o_lat, o_lon],
+        icon=folium.Icon(color="blue", icon="star"),
+        tooltip="Perceelpunt",
+        popup=f"Perceel (lat={o_lat:.5f}, lon={o_lon:.5f})"
+    ).add_to(m)
+
+    # Gekozen locaties (rode markers)
+    for _, r in picked.iterrows():
+        lat = float(r["latitude"])
+        lon = float(r["longitude"])
+        key = r.get("POSTCODE_KEY", "")
+        ton = r.get("ton", float("nan"))
+        laad = r.get("laadlocaties", float("nan"))
+        afstand = r.get("afstand_km", float("nan"))
+        folium.CircleMarker(
+            location=[lat, lon],
+            radius=6,
+            color="red",
+            fill=True,
+            fill_opacity=0.9,
+            tooltip=f"{key}",
+            popup=(f"<b>{key}</b><br>"
+                   f"Ton/jaar: {ton:,.2f}<br>"
+                   f"Laadlocaties: {int(laad)}<br>"
+                   f"Afstand: {afstand:.1f} km")
+        ).add_to(m)
+
+    m.save("kaart.html")
+    print("\n[Info] Kaart opgeslagen als 'kaart.html'. Open dit bestand handmatig in de browser (via Download in Codespaces).")
+
+
+
 # ---------- Main flow ----------
-def run(perceelcode: str, radius_km: float, save_outputs: bool = False):
+def run(perceelcode: str, radius_km: float, save_outputs: bool = False, include_german: bool = False):
     if not valideer_perceelcode(perceelcode):
         raise ValueError("Perceelcode formaat ongeldig. Voorbeeld: 'ABCD A 1234'.")
 
     # 1) Origin-coördinaten ophalen
     o_lat, o_lon = zoek_perceel_coordinaten(perceelcode)
+  
+    global o_lat_global, o_lon_global
+    o_lat_global, o_lon_global = o_lat, o_lon
 
     # 2) Data inlezen
-    df = pd.read_csv(CSV, sep=";", decimal=",", thousands=".")
+    df = pd.read_csv(CSV, sep=";")  
 
     # komma→punt voor numerieke kolommen
     for c in df.columns:
@@ -76,59 +210,87 @@ def run(perceelcode: str, radius_km: float, save_outputs: bool = False):
 
     # 3) Benodigde kolommen vinden
     postcode_col      = find_column("postcode", df.columns, "Geen postcode-kolom gevonden.")
-    month_col         = find_column("maand", df.columns, "Geen maand-kolom gevonden.")
     kg_col            = find_column("kg", df.columns, "Geen kolom met kilos gevonden.")
     laadlocatie_col   = find_column("aantal_laadlocaties", df.columns, "Geen kolom met aantal_laadlocaties gevonden.")
-    provincie_col     = find_column("provincie", df.columns, "Geen provincie-kolom gevonden.")
 
-    df[kg_col] = (
-       df[kg_col]
-       .astype(str)
-       .str.replace(".", "", regex=False)   # verwijder duizendtallen
-       .str.replace(",", ".", regex=False)  # vervang decimaal
+    # 4) Postcodes normaliseren en land detecteren
+    pc_raw_col = postcode_col  
+    df["PC_CLEAN"] = df[pc_raw_col].astype(str).apply(normalize_pc)
+    df["PC_TYPE"]  = df["PC_CLEAN"].apply(detect_country)  # NL6, NL4, DE, of None
+    df = df[df["PC_TYPE"].notna()].copy() 
+
+    # 4b) POSTCODE_KEY = wat jij als 'sleutel' wil tonen/groeperen
+    # - NL: gebruik PC6 als beschikbaar, anders PC4
+    # - DE: gebruik PLZ (5 cijfers)
+    df["POSTCODE_KEY"] = np.where(
+        df["PC_TYPE"].eq("NL6"), df["PC_CLEAN"],
+        np.where(df["PC_TYPE"].eq("NL4"), df["PC_CLEAN"],
+                 np.where(df["PC_TYPE"].eq("DE"), df["PC_CLEAN"], np.nan))
     )
-    df[kg_col] = pd.to_numeric(df[kg_col], errors="coerce")
 
-    # 4) Postcode → PC4
-    df["PC4"] = (
-        df[postcode_col]
-        .astype(str).str.upper()
-        .str.replace(r"\s+", "", regex=True)
-        .str.extract(r"(\d{4})")[0]
-    )
-    df = df.dropna(subset=["PC4"])
+    # 4c) GEO_KEY + GEO_COUNTRY voor geocoding:
+    # - NL geocode op PC4 (centroid)
+    # - DE geocode op PLZ (5 cijfers)
+    df["GEO_COUNTRY"] = np.where(df["PC_TYPE"].str.startswith("NL"), "NL", 
+                                 np.where(df["PC_TYPE"].eq("DE"), "DE", None))
+    df["GEO_KEY"] = np.where(df["GEO_COUNTRY"].eq("NL"),
+                             df["PC_CLEAN"].str[:4],   # NL → PC4
+                             np.where(df["GEO_COUNTRY"].eq("DE"),
+                                      df["PC_CLEAN"],  # DE → PLZ (5 cijfers)
+                                      np.nan))
+    
+    
+    # === Alleen filteren als gebruiker dat niet wil ===
+    if not include_german:
+       df = df[df["GEO_COUNTRY"].ne("DE") | df["GEO_COUNTRY"].isna()].copy()
 
-    # 5) Coördinaten per PC4 (pgeocode)
-    nomi = pgeocode.Nominatim("NL")
-    pc4_list = df["PC4"].unique().tolist()
-    coords = nomi.query_postal_code(pc4_list)[["postal_code", "latitude", "longitude"]]\
-                 .rename(columns={"postal_code":"PC4"})
-    df = df.merge(coords, on="PC4", how="left")
-    df = df.dropna(subset=["latitude", "longitude"])
+    # 5) Coördinaten per land ophalen met pgeocode
+    nl_keys = sorted(df.loc[df["GEO_COUNTRY"].eq("NL"), "GEO_KEY"].dropna().unique().tolist())
+    de_keys = sorted(df.loc[df["GEO_COUNTRY"].eq("DE"), "GEO_KEY"].dropna().unique().tolist())
+
+    frames = []
+
+    if nl_keys:
+        nomi_nl = pgeocode.Nominatim("NL")
+        nl_coords = nomi_nl.query_postal_code(nl_keys)[["postal_code","latitude","longitude"]]
+        nl_coords = nl_coords.rename(columns={"postal_code": "GEO_KEY"})
+        nl_coords["GEO_COUNTRY"] = "NL"
+        frames.append(nl_coords)
+
+    if de_keys:
+        nomi_de = pgeocode.Nominatim("DE")
+        de_coords = nomi_de.query_postal_code(de_keys)[["postal_code","latitude","longitude"]]
+        de_coords = de_coords.rename(columns={"postal_code": "GEO_KEY"})
+        de_coords["GEO_COUNTRY"] = "DE"
+        frames.append(de_coords)
+
+    coords_df = pd.concat(frames, ignore_index=True) if frames else pd.DataFrame(columns=["GEO_KEY","latitude","longitude","GEO_COUNTRY"])
+
+    # Merge op (GEO_KEY, GEO_COUNTRY) om botsingen te voorkomen
+    df = df.merge(coords_df, on=["GEO_KEY","GEO_COUNTRY"], how="left")
 
     # 6) Afstanden en filter op radius
-    dists = haversine_km(o_lat, o_lon, df["latitude"].values, df["longitude"].values)
-    in_range = df.loc[dists <= radius_km].copy()
-    in_range["afstand_km"] = dists[dists <= radius_km]
+    df_geo = df.dropna(subset=["latitude", "longitude"]).copy()
+    dists = haversine_km(o_lat, o_lon, df_geo["latitude"].values, df_geo["longitude"].values)
+    df_geo["afstand_km"] = dists
+    in_range = df_geo.loc[df_geo["afstand_km"] <= radius_km].copy()
 
     # 7) Aggregaties
-    # unieke laadlocaties en paarden tellen op PC4-niveau (eerste waarde per PC4 optellen)
-    unique_laadlocaties = in_range.groupby("PC4")[laadlocatie_col].first().sum()
+    # unieke laadlocaties tellen op PC4/6-niveau 
+    total_laadlocaties = (
+    in_range.groupby("POSTCODE_KEY")[laadlocatie_col]
+            .sum()
+            .fillna(0)
+            .astype(float)
+            .sum()
+    )
+
+    # >>> Grootste locaties binnen radius tot target (lijst met POSTCODE_KEY, ton, laadlocaties)
+    top_postcodes_tot_target(in_range, kg_col, laadlocatie_col, ROOT, group_key="POSTCODE_KEY")
 
     # totals
     in_range[kg_col] = pd.to_numeric(in_range[kg_col], errors="coerce")
     total_ton = in_range[kg_col].sum() / 1000
-
-    # per maand
-    in_range[month_col] = pd.to_numeric(in_range[month_col], errors="coerce")
-    per_maand = (
-        in_range.groupby(month_col, as_index=False)[kg_col]
-        .sum()
-        .rename(columns={kg_col: "TOTAAL_KG"})
-        .sort_values(month_col)
-    )
-    per_maand["TOTAAL_TON"] = per_maand["TOTAAL_KG"] / 1000
-    per_maand["TOTAAL_TON"] = per_maand["TOTAAL_TON"].map("{:,.2f}".format)
 
     # 8) Samenvatting
     summary = pd.DataFrame({
@@ -137,22 +299,24 @@ def run(perceelcode: str, radius_km: float, save_outputs: bool = False):
         "Radius_km":       [radius_km],
         "Aantal_rijen":    [len(in_range)],
         "Totaal_ton":      [total_ton],
-        "Aantal_laadlocs": [unique_laadlocaties],
+        "Aantal_laadlocs": [total_laadlocaties],
     })
 
     # Console-output
     print(f"\nPostcodes binnen {radius_km:.0f} km van lat: {o_lat:.5f}, lon: {o_lon:.5f}, perceel: {perceelcode}")
-    print(f"Aantal rijen (per maand, 12x): {len(in_range)}")
+    print(f"Aantal rijen: {len(in_range)}")
     print(f"Totaal ton paardenmest: {total_ton:,.2f}")
-    print(f"Aantal unieke laadlocaties (uniek): {unique_laadlocaties}\n")
-    print("Som per maand (ton):")
-    print(per_maand[[month_col, "TOTAAL_TON"]].to_string(index=False))
-
-    return in_range, summary, per_maand
+    print(f"Aantal unieke laadlocaties: {total_laadlocaties}\n")
+    
+    return in_range, summary
 
 # ---------- CLI ----------
 if __name__ == "__main__":
     perceel = input("Perceelcode: ").strip().upper()
     radius  = float(input("Radius in km: "))
-    run(perceel, radius, save_outputs=False)
+    inc_de = input("Duitse postcodes meenemen? (j/n): ").strip().lower()
+    include_german = inc_de in ["j", "ja", "y", "yes"]
+    run(perceel, radius, save_outputs=False, include_german=include_german)
 
+#niet bestaande postcodes nog erin
+#Natura2000 gebied welke het meest dichtbij is
