@@ -7,6 +7,7 @@ from math import radians, sin, cos, sqrt, atan2
 import pgeocode
 import folium
 from IPython.display import display
+from folium.plugins import FloatImage
 
 # ---------- Path to data ----------
 ROOT = Path(__file__).resolve().parents[1]
@@ -118,12 +119,6 @@ def top_postcodes_tot_target(in_range: pd.DataFrame, kg_col: str, laadlocatie_co
 
     picked = pd.DataFrame(picked_rows)
 
-    # print("\n=== Largest locations up to target (within radius) ===")
-    # print(f"Target (tons/year):        {target_ton:,.2f}")
-    # print(f"Chosen {group_key}s:   {len(picked)}")
-    # print(f"Total tons reached:       {cum_ton:,.2f}")
-    # print(f"Total loading locations:      {cum_loc}")
-
     print("\n=== Largest locations up to target (within radius) ===")
     print(f"Target (tons/year):       {target_ton:,.2f}")
     print(f"Chosen {group_key}s:     {len(picked)}")
@@ -197,6 +192,22 @@ def save_map_for_picked(picked: pd.DataFrame, o_lat: float, o_lon: float, out_ht
                    f"Distance: {afstand:.1f} km")
         ).add_to(m)
 
+    
+    legend_html = """
+    <div style="
+        position: fixed; 
+        bottom: 30px; left: 30px; width: 180px; 
+        z-index: 9999; font-size: 14px;
+        background-color: white;
+        padding: 10px; border:2px solid grey; border-radius:8px;
+    ">
+    <b>Legend</b><br>
+    <span style="color: blue;">★</span> Parcel (origin)<br>
+    <span style="color: red;">●</span> Selected zip code<br>
+    </div>
+    """
+
+    m.get_root().html.add_child(folium.Element(legend_html))
     m.save("kaart.html")
     print(f"\n[Info] Map saved to '{out_html}'. Open this file manually in your browser. (via download in codespace)")
 
@@ -291,6 +302,15 @@ def run(perceelcode: str, radius_km: float, save_outputs: bool = False, include_
 
     # Merge on (GEO_KEY, GEO_COUNTRY) to avoid collisions
     df = df.merge(coords_df, on=["GEO_KEY","GEO_COUNTRY"], how="left")
+
+    MANUAL_PC6_COORDS = {
+        "3062CG": (51.9278, 4.5296),
+    }
+
+    for pc6, (lat_fix, lon_fix) in MANUAL_PC6_COORDS.items():
+        mask = df["PC_CLEAN"].eq(pc6)
+        df.loc[mask, "latitude"] = lat_fix
+        df.loc[mask, "longitude"] = lon_fix
 
     # 6) Distances and filter by radius
     df_geo = df.dropna(subset=["latitude", "longitude"]).copy()
