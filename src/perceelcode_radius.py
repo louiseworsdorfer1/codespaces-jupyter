@@ -6,7 +6,6 @@ import requests, re
 from math import radians, sin, cos, sqrt, atan2
 import pgeocode
 import folium
-from IPython.display import display
 from folium.plugins import FloatImage
 
 # ---------- Path to data ----------
