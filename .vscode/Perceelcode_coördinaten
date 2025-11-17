@@ -80,7 +80,7 @@ def detect_country(pc_clean: str) -> str | None:
     return None
 
 # Select, within the current radius, the largest locations (per group_key, default PC4/PC6 key) until the target (ton/year) is reached 
-def top_postcodes_tot_target(in_range: pd.DataFrame, kg_col: str, laadlocatie_col: str, root: Path, group_key: str = "POSTCODE_KEY", radius_km: float = None):
+def top_postcodes_tot_target(in_range: pd.DataFrame, kg_col: str, laadlocatie_col: str, root: Path, group_key: str = "POSTCODE_KEY", radius_km: float = None, target_ton: float | None = None):
     df = in_range.copy()
     df[kg_col] = pd.to_numeric(df[kg_col], errors="coerce")
     df[laadlocatie_col] = pd.to_numeric(df[laadlocatie_col], errors="coerce")
@@ -104,7 +104,8 @@ def top_postcodes_tot_target(in_range: pd.DataFrame, kg_col: str, laadlocatie_co
     yearly = yearly.sort_values(["ton", "laadlocaties"], ascending=[False, True]).reset_index(drop=True)
 
     # Ask user for target
-    target_ton = float(input("Enter the target (tons/year) to select largest loading locations within the radius: ").strip())
+    if target_ton is None:
+        target_ton = float(input("Enter the target (tons/year) to select largest loading locations within the radius: ").strip())
 
     # greedy selection until target is reached
     picked_rows, cum_ton, cum_loc = [], 0.0, 0
