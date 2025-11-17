@@ -4,7 +4,7 @@ import folium
 from streamlit_folium import st_folium
 
 # import your functions/vars
-from src.perceelcode_coördinaten import run, ROOT, o_lat_global, o_lon_global
+from src.perceelcode_radius import run, ROOT, o_lat_global, o_lon_global
 
 st.set_page_config(page_title="Parcel Radius Analysis", layout="wide")
 
