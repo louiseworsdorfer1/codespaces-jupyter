@@ -80,7 +80,7 @@ def detect_country(pc_clean: str) -> str | None:
     return None
 
 # Select, within the current radius, the largest locations (per group_key, default PC4/PC6 key) until the target (ton/year) is reached 
-def top_postcodes_tot_target(in_range: pd.DataFrame, kg_col: str, laadlocatie_col: str, root: Path, group_key: str = "POSTCODE_KEY"):
+def top_postcodes_tot_target(in_range: pd.DataFrame, kg_col: str, laadlocatie_col: str, root: Path, group_key: str = "POSTCODE_KEY", radius_km: float = None):
     df = in_range.copy()
     df[kg_col] = pd.to_numeric(df[kg_col], errors="coerce")
     df[laadlocatie_col] = pd.to_numeric(df[laadlocatie_col], errors="coerce")
@@ -134,22 +134,20 @@ def top_postcodes_tot_target(in_range: pd.DataFrame, kg_col: str, laadlocatie_co
         return picked
 
     picked = picked.assign(
-        laadlocaties=picked["laadlocaties"].astype(int),
-        ton=picked["ton"].round(2),
+        loading_locations=picked["laadlocaties"].astype(int),
+        tons=picked["ton"].round(2),
     )
-    picked["cum_ton"] = picked["ton"].cumsum().round(2)
-    picked["cum_laadloc"] = picked["laadlocaties"].cumsum()
-    picked["afstand_km"] = picked["afstand_km"].round(1)
+    picked["distance_km"] = picked["afstand_km"].round(1)
 
-    cols_show = [group_key, "ton", "laadlocaties", "afstand_km", "cum_ton", "cum_laadloc"]
+    cols_show = [group_key, "tons", "loading_locations", "distance_km"]
     print()
     print(picked[cols_show].to_string(index=False))
     out_html = (root / "outputs" / "kaart_grootste_locaties.html")
     out_html.parent.mkdir(parents=True, exist_ok=True)
-    save_map_for_picked(picked, o_lat_global, o_lon_global, out_html)
+    save_map_for_picked(picked, o_lat_global, o_lon_global, out_html, radius_km=radius_km)
 
 # Create an interactive map with: blue star (parcel point) and red dots (selected POSTCODE_KEYs)
-def save_map_for_picked(picked: pd.DataFrame, o_lat: float, o_lon: float, out_html: Path):
+def save_map_for_picked(picked: pd.DataFrame, o_lat: float, o_lon: float, out_html: Path, radius_km: float = None):
     if picked.empty or {"latitude", "longitude"}.isdisjoint(picked.columns):
         print("[Info] No coordinates in 'picked' to plot.")
         return
@@ -160,10 +158,22 @@ def save_map_for_picked(picked: pd.DataFrame, o_lat: float, o_lon: float, out_ht
     # Mark the parcel
     folium.Marker(
         [o_lat, o_lon],
-        icon=folium.Icon(color="blue", icon="star"),
-        tooltip="Perceelpunt",
+        icon=folium.Icon(color="blue", icon="star"), 
+        tooltip="Parcel point",
         popup=f"Perceel (lat={o_lat:.5f}, lon={o_lon:.5f})"
     ).add_to(m)
+
+    # Add radius circle around parcel
+    if radius_km is not None:
+        folium.Circle(
+            location=[o_lat, o_lon],
+            radius=radius_km * 1000,   # km → meters
+            color="royalblue",
+            fill =True,
+            fill_opacity=0.04,
+            weight=2,
+            tooltip=f"Radius {radius_km:.0f} km"
+        ).add_to(m)
 
     # Selected locations (red markers)
     for _, r in picked.iterrows():
@@ -181,9 +191,9 @@ def save_map_for_picked(picked: pd.DataFrame, o_lat: float, o_lon: float, out_ht
             fill_opacity=0.9,
             tooltip=f"{key}",
             popup=(f"<b>{key}</b><br>"
-                   f"Ton/jaar: {ton:,.2f}<br>"
-                   f"Laadlocaties: {int(laad)}<br>"
-                   f"Afstand: {afstand:.1f} km")
+                   f"Tons/year: {ton:,.2f}<br>"
+                   f"Loading locations: {int(laad)}<br>"
+                   f"Distance: {afstand:.1f} km")
         ).add_to(m)
 
     m.save("kaart.html")
@@ -298,7 +308,7 @@ def run(perceelcode: str, radius_km: float, save_outputs: bool = False, include_
     )
 
     # >>> Largest locations within radius up to target (list with POSTCODE_KEY, tons, laadlocaties)
-    top_postcodes_tot_target(in_range, kg_col, laadlocatie_col, ROOT, group_key="POSTCODE_KEY")
+    top_postcodes_tot_target(in_range, kg_col, laadlocatie_col, ROOT, group_key="POSTCODE_KEY", radius_km=radius_km)
 
     # totals
     in_range[kg_col] = pd.to_numeric(in_range[kg_col], errors="coerce")
@@ -315,7 +325,7 @@ def run(perceelcode: str, radius_km: float, save_outputs: bool = False, include_
     })
 
     # Console output
-    print(f"\nZipcodes within {radius_km:.0f} km van lat: {o_lat:.5f}, lon: {o_lon:.5f}, perceel: {perceelcode}")
+    print(f"\nZip codes within {radius_km:.0f} km van lat: {o_lat:.5f}, lon: {o_lon:.5f}, perceel: {perceelcode}")
     print(f"Rows in range: {len(in_range)}")
     print(f"Total tons: {total_ton:,.2f}")
     print(f"Total loading locations: {total_laadlocaties}\n")
@@ -326,6 +336,6 @@ def run(perceelcode: str, radius_km: float, save_outputs: bool = False, include_
 if __name__ == "__main__":
     perceel = input("Parcel code: ").strip().upper()
     radius  = float(input("Radius in km: "))
-    inc_de = input("Include German zipcodes? (y/n): ").strip().lower()
+    inc_de = input("Include German zip codes? (y/n): ").strip().lower()
     include_german = inc_de in ["j", "ja", "y", "yes"]
     run(perceel, radius, save_outputs=False, include_german=include_german)
