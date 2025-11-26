@@ -264,7 +264,7 @@ def run(perceelcode: str, radius_km: float, save_outputs: bool = False, include_
                      np.where(df["GEO_COUNTRY"].eq("DE"),
                               df["PC_CLEAN"],              # DE → 5-digit PLZ
                               np.nan)))
-    
+
     # === Filter out German postcodes unless the user wants them ===
     if not include_german:
        df = df[df["GEO_COUNTRY"].ne("DE") | df["GEO_COUNTRY"].isna()].copy()
