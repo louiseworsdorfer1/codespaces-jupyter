@@ -149,6 +149,24 @@ def top_postcodes_tot_target(in_range: pd.DataFrame, kg_col: str, laadlocatie_co
     print()
     print(picked[cols_show].to_string(index=False))
 
+        # === Save optimisation result to Excel ===
+    excel_out = root / "outputs" / "optimalisatie_resultaat.xlsx"
+    excel_out.parent.mkdir(parents=True, exist_ok=True)
+
+    # kleine samenvatting in een aparte sheet
+    summary_df = pd.DataFrame({
+        "Target_tons_per_year":   [target_ton],
+        "Chosen_postcode_keys":   [len(picked)],
+        "Total_tons_reached":     [cum_ton],
+        "Total_loading_locations":[cum_loc],
+    })
+
+    with pd.ExcelWriter(excel_out, engine="xlsxwriter") as writer:
+        picked[cols_show].to_excel(writer, sheet_name="Geselecteerde_locs", index=False)
+        summary_df.to_excel(writer, sheet_name="Samenvatting", index=False)
+
+    print(f"[Info] Optimalisatie-output saved to: {excel_out}")
+
     out_html = (root / "outputs" / "kaart_grootste_locaties.html")
     out_html.parent.mkdir(parents=True, exist_ok=True)
     save_map_for_picked(
@@ -269,6 +287,11 @@ def run(perceelcode: str, radius_km: float, save_outputs: bool = False, include_
             # alleen als een waarde eruitziet als een getal met punten
             if df[col].str.contains(r"^\d{1,3}(?:\.\d{3})+$", regex=True, na=False).any():
                 df[col] = df[col].str.replace(".", "", regex=False)
+
+    for col in ["KVK nummer", "tel nummer"]:
+        if col in df.columns:
+            df[col] = df[col].astype(str).str.replace(".0", "", regex=False)
+            df[col] = df[col].str.strip()
 
     # 3) Find required columns
     postcode_col      = find_column("postcode", df.columns, "No postcode column found")
