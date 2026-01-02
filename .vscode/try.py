@@ -10,7 +10,7 @@ from folium.plugins import FloatImage
 
 # ---------- Path to data ----------
 ROOT = Path(__file__).resolve().parents[1]
-CSV  = ROOT / "data" / "data_afvoerlocaties_2024.csv"  
+CSV  = ROOT / "data" / "data_afvoerlocaties_2024_met_adressen.csv"  
 
 o_lat_global = None
 o_lon_global = None
@@ -80,21 +80,29 @@ def detect_country(pc_clean: str) -> str | None:
     return None
 
 # Select, within the current radius, the largest locations (per group_key, default PC4/PC6 key) until the target (ton/year) is reached 
-def top_postcodes_tot_target(in_range: pd.DataFrame, kg_col: str, laadlocatie_col: str, root: Path, group_key: str = "POSTCODE_KEY", radius_km: float = None, target_ton: float | None = None):
+def top_postcodes_tot_target(in_range: pd.DataFrame, kg_col: str, laadlocatie_col: str, root: Path, group_key: str = "POSTCODE_KEY", radius_km: float = None, target_ton: float | None = None, extra_cols: list[str] | None = None):
     df = in_range.copy()
     df[kg_col] = pd.to_numeric(df[kg_col], errors="coerce")
     df[laadlocatie_col] = pd.to_numeric(df[laadlocatie_col], errors="coerce")
 
     # Yearly aggregation per PC6/PC4: sum kg, sum laadlocaties, mean distance and coordinates
+    agg_dict = {
+        "kg_sum":        (kg_col, "sum"),
+        "laadlocaties":  (laadlocatie_col, "sum"),
+        "afstand_km":    ("afstand_km", "mean"),
+        "latitude":      ("latitude", "mean"),
+        "longitude":     ("longitude", "mean"),
+    }
+
+    # Extra niet-numerieke info per postcode (bv. naam stal, adres, etc.)
+    if extra_cols:
+        for c in extra_cols:
+            # neem bv. de eerste waarde binnen de groep
+            agg_dict[c] = (c, "first")
+
     yearly = (
         df.groupby(group_key, as_index=False)
-          .agg(
-              kg_sum=(kg_col, "sum"),
-              laadlocaties=(laadlocatie_col, "sum"),
-              afstand_km=("afstand_km", "mean"),
-              latitude=("latitude", "mean"),
-              longitude=("longitude", "mean"),
-          )
+          .agg(**agg_dict)
           .dropna(subset=["kg_sum"])
     )
     yearly["ton"] = yearly["kg_sum"] / 1000.0
@@ -135,14 +143,120 @@ def top_postcodes_tot_target(in_range: pd.DataFrame, kg_col: str, laadlocatie_co
     picked["distance_km"] = picked["afstand_km"].round(1)
 
     cols_show = [group_key, "tons", "loading_locations", "distance_km"]
+    if extra_cols:
+        cols_show += extra_cols
+
     print()
     print(picked[cols_show].to_string(index=False))
+
+        # === Save optimisation result to Excel ===
+    excel_out = root / "outputs" / "optimalisatie_resultaat.xlsx"
+    excel_out.parent.mkdir(parents=True, exist_ok=True)
+
+    # kleine samenvatting in een aparte sheet
+    summary_df = pd.DataFrame({
+        "Target_tons_per_year":   [target_ton],
+        "Chosen_postcode_keys":   [len(picked)],
+        "Total_tons_reached":     [cum_ton],
+        "Total_loading_locations":[cum_loc],
+    })
+
+    with pd.ExcelWriter(excel_out, engine="xlsxwriter") as writer:
+        picked[cols_show].to_excel(writer, sheet_name="Geselecteerde_locs", index=False)
+        summary_df.to_excel(writer, sheet_name="Samenvatting", index=False)
+
+    print(f"[Info] Optimalisatie-output saved to: {excel_out}")
+
     out_html = (root / "outputs" / "kaart_grootste_locaties.html")
     out_html.parent.mkdir(parents=True, exist_ok=True)
-    save_map_for_picked(picked, o_lat_global, o_lon_global, out_html, radius_km=radius_km)
+    save_map_for_picked(
+        picked,
+        o_lat_global,
+        o_lon_global,
+        out_html,
+        radius_km=radius_km,
+        extra_cols=extra_cols,
+    )
+
+
+# --- Province filter via NL PC4 ranges (approximate) ---
+PROVINCE_PC4_RANGES = {
+    "Gelderland": [(6700, 6999), (7000, 7399), (3840, 3899), (8050, 8199), (4000, 4199)],
+    "Zuid-Holland": [(2200, 2399), (2500, 3399)],
+    "Noord-Holland": [(1000, 2199), (1900, 1999), (2400, 2499)],
+    "Utrecht": [(3400, 3999)],
+    "Overijssel": [(7400, 8199)],
+    "Noord-Brabant": [(4600, 5999)],
+    "Limburg": [(6000, 6599)],
+    "Zeeland": [(4300, 4599)],
+    "Friesland": [(8400, 9299)],
+    "Groningen": [(9300, 9999)],
+    "Drenthe": [(7700, 7999)],
+    "Flevoland": [(8200, 8399)],
+}
+
+def pc4_in_province(pc4: str, province: str) -> bool:
+    if not isinstance(pc4, str):
+        return False
+    pc4 = pc4.strip()
+    if not re.fullmatch(r"\d{4}", pc4):
+        return False
+    n = int(pc4)
+    for a, b in PROVINCE_PC4_RANGES.get(province, []):
+        if a <= n <= b:
+            return True
+    return False
+
+def province_totals_and_postcodes_by_range(
+    df_any: pd.DataFrame,
+    kg_col: str,
+    laadlocatie_col: str,
+    province_name: str,
+) -> tuple[pd.DataFrame, dict]:
+    df = df_any.copy()
+    df[kg_col] = pd.to_numeric(df[kg_col], errors="coerce")
+    df[laadlocatie_col] = pd.to_numeric(df[laadlocatie_col], errors="coerce")
+
+    # Only NL (ranges are NL PC4)
+    df = df[df["GEO_COUNTRY"].eq("NL")].copy()
+
+    # NL PC4 is GEO_KEY in your pipeline (string)
+    df["NL_PC4"] = df["GEO_KEY"].astype(str).str[:4]
+
+    df_prov = df[df["NL_PC4"].apply(lambda x: pc4_in_province(x, province_name))].copy()
+
+    if df_prov.empty:
+        return df_prov, {
+            "province": province_name,
+            "pc4_ranges": PROVINCE_PC4_RANGES.get(province_name, []),
+            "postcodes": 0,
+            "total_tons": 0.0,
+            "total_loading_locations": 0,
+        }
+
+    agg = (
+        df_prov.groupby("POSTCODE_KEY", as_index=False)
+        .agg(
+            kg_sum=(kg_col, "sum"),
+            loading_locations=(laadlocatie_col, "sum"),
+        )
+    )
+    agg["tons"] = agg["kg_sum"] / 1000.0
+    agg = agg.sort_values("tons", ascending=False).reset_index(drop=True)
+
+    summary = {
+        "province": province_name,
+        "pc4_ranges": PROVINCE_PC4_RANGES.get(province_name, []),
+        "postcodes": int(agg["POSTCODE_KEY"].nunique()),
+        "total_tons": float(agg["tons"].sum()),
+        "total_loading_locations": int(agg["loading_locations"].fillna(0).sum()),
+    }
+    return agg, summary
+
+
 
 # Create an interactive map with: blue star (parcel point) and red dots (selected POSTCODE_KEYs)
-def save_map_for_picked(picked: pd.DataFrame, o_lat: float, o_lon: float, out_html: Path, radius_km: float = None):
+def save_map_for_picked(picked: pd.DataFrame, o_lat: float, o_lon: float, out_html: Path, radius_km: float = None, extra_cols: list[str] = None):
     if picked.empty or {"latitude", "longitude"}.isdisjoint(picked.columns):
         print("[Info] No coordinates in 'picked' to plot.")
         return
@@ -178,6 +292,24 @@ def save_map_for_picked(picked: pd.DataFrame, o_lat: float, o_lon: float, out_ht
         ton = r.get("ton", float("nan"))
         laad = r.get("laadlocaties", float("nan"))
         afstand = r.get("afstand_km", float("nan"))
+        extra_html = ""
+        if extra_cols:
+            for col in extra_cols:
+                val = r.get(col, "")
+                # alleen tonen als er iets in staat
+                if pd.notna(val) and val != "":
+                    extra_html += f"{col}: {val}<br>"
+
+        popup_html = (
+            f"<b>{key}</b><br>"
+            f"Tons/year: {ton:,.2f}<br>"
+            f"Loading locations: {int(laad)}<br>"
+            f"Distance: {afstand:.1f} km<br>"
+            f"{extra_html}"
+        )
+        
+        popup = folium.Popup(popup_html, max_width=400)
+
         folium.CircleMarker(
             location=[lat, lon],
             radius=6,
@@ -185,10 +317,7 @@ def save_map_for_picked(picked: pd.DataFrame, o_lat: float, o_lon: float, out_ht
             fill=True,
             fill_opacity=0.9,
             tooltip=f"{key}",
-            popup=(f"<b>{key}</b><br>"
-                   f"Tons/year: {ton:,.2f}<br>"
-                   f"Loading locations: {int(laad)}<br>"
-                   f"Distance: {afstand:.1f} km")
+            popup=popup,
         ).add_to(m)
 
     
@@ -207,7 +336,7 @@ def save_map_for_picked(picked: pd.DataFrame, o_lat: float, o_lon: float, out_ht
     """
 
     m.get_root().html.add_child(folium.Element(legend_html))
-    m.save("kaart.html")
+    m.save("kaart.html") #str(out_html)
     print(f"\n[Info] Map saved to '{out_html}'. Open this file manually in your browser. (via download in codespace)")
 
 # ---------- Main flow ----------
@@ -223,16 +352,39 @@ def run(perceelcode: str, radius_km: float, save_outputs: bool = False, include_
 
     # 2) Load data
     df = pd.read_csv(CSV, sep=";")  
+    df.columns = df.columns.str.strip()
 
     # comma→dot for numeric-looking string columns
-    for c in df.columns:
-        if df[c].dtype == object and df[c].astype(str).str.contains(",", na=False).any():
-            df[c] = pd.to_numeric(df[c].astype(str).str.replace(",", ".", regex=False), errors="coerce")
+    # for c in df.columns:
+    #     if df[c].dtype == object and df[c].astype(str).str.contains(",", na=False).any():
+    #         df[c] = pd.to_numeric(df[c].astype(str).str.replace(",", ".", regex=False), errors="coerce")
+
+    for col in df.columns:
+        if df[col].dtype == object:
+            # alleen als een waarde eruitziet als een getal met punten
+            if df[col].str.contains(r"^\d{1,3}(?:\.\d{3})+$", regex=True, na=False).any():
+                df[col] = df[col].str.replace(".", "", regex=False)
+
+    for col in ["KVK nummer", "tel nummer"]:
+        if col in df.columns:
+            df[col] = df[col].astype(str).str.replace(".0", "", regex=False)
+            df[col] = df[col].str.strip()
 
     # 3) Find required columns
     postcode_col      = find_column("postcode", df.columns, "No postcode column found")
     kg_col            = find_column("kg", df.columns, "No 'kg' column found.")
     laadlocatie_col   = find_column("aantal_laadlocaties", df.columns, "No 'aantal_laadlocaties' column found.")
+
+    candidate_extra_cols = [
+        "Naam stal",
+        "Straat + huisnummer",
+        "Plaats",
+        "KVK nummer",
+        "tel nummer",
+    ]
+
+    # Neem alleen kolommen die echt bestaan in de CSV
+    extra_cols = [c for c in candidate_extra_cols if c in df.columns]   
 
     # 4) Normalize postcodes and detect country/format
     pc_raw_col = postcode_col  
@@ -328,7 +480,7 @@ def run(perceelcode: str, radius_km: float, save_outputs: bool = False, include_
     )
 
     # >>> Largest locations within radius up to target (list with POSTCODE_KEY, tons, laadlocaties)
-    top_postcodes_tot_target(in_range, kg_col, laadlocatie_col, ROOT, group_key="POSTCODE_KEY", radius_km=radius_km)
+    top_postcodes_tot_target(in_range, kg_col, laadlocatie_col, ROOT, group_key="POSTCODE_KEY", radius_km=radius_km, extra_cols=extra_cols)
 
     # totals
     in_range[kg_col] = pd.to_numeric(in_range[kg_col], errors="coerce")
@@ -350,6 +502,17 @@ def run(perceelcode: str, radius_km: float, save_outputs: bool = False, include_
     print(f"Total tons: {total_ton:,.2f}")
     print(f"Total loading locations: {total_laadlocaties}\n")
     
+    prov = "Gelderland"  # of input("Provincie: ").strip()
+    prov_df, prov_summary = province_totals_and_postcodes_by_range(df_geo, kg_col, laadlocatie_col, prov)
+
+
+    print("\n=== Province summary ===")
+    print(prov_summary)
+
+    if not prov_df.empty:
+        print("\nTop postcodes in province:")
+        print(prov_df[["POSTCODE_KEY", "tons", "loading_locations"]].head(20).to_string(index=False))
+
     return in_range, summary
 
 # ---------- CLI ----------
