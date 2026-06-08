@@ -80,7 +80,7 @@ def detect_country(pc_clean: str) -> str | None:
     return None
 
 # Select, within the current radius, the largest locations (per group_key, default PC4/PC6 key) until the target (ton/year) is reached 
-def top_postcodes_tot_target(in_range: pd.DataFrame, kg_col: str, laadlocatie_col: str, root: Path, group_key: str = "POSTCODE_KEY", radius_km: float = None, target_ton: float | None = None, extra_cols: list[str] | None = None):
+def top_postcodes_tot_target(in_range: pd.DataFrame, kg_col: str, laadlocatie_col: str, root: Path, group_key: str = "POSTCODE_KEY", radius_nl_km: float = None, radius_de_km: float = None, target_ton: float | None = None, extra_cols: list[str] | None = None):
     df = in_range.copy()
     df[kg_col] = pd.to_numeric(df[kg_col], errors="coerce")
     df[laadlocatie_col] = pd.to_numeric(df[laadlocatie_col], errors="coerce")
@@ -174,7 +174,8 @@ def top_postcodes_tot_target(in_range: pd.DataFrame, kg_col: str, laadlocatie_co
         o_lat_global,
         o_lon_global,
         out_html,
-        radius_km=radius_km,
+        radius_nl_km=radius_nl_km,
+        radius_de_km=radius_de_km,
         extra_cols=extra_cols,
     )
 
@@ -256,7 +257,7 @@ def province_totals_and_postcodes_by_range(
 
 
 # Create an interactive map with: blue star (parcel point) and red dots (selected POSTCODE_KEYs)
-def save_map_for_picked(picked: pd.DataFrame, o_lat: float, o_lon: float, out_html: Path, radius_km: float = None, extra_cols: list[str] = None):
+def save_map_for_picked(picked: pd.DataFrame, o_lat: float, o_lon: float, out_html: Path, radius_nl_km: float = None, radius_de_km: float = None, extra_cols: list[str] = None):
     if picked.empty or {"latitude", "longitude"}.isdisjoint(picked.columns):
         print("[Info] No coordinates in 'picked' to plot.")
         return
@@ -273,16 +274,28 @@ def save_map_for_picked(picked: pd.DataFrame, o_lat: float, o_lon: float, out_ht
     ).add_to(m)
 
     # Add radius circle around parcel
-    if radius_km is not None:
+    if radius_nl_km is not None:
         folium.Circle(
             location=[o_lat, o_lon],
-            radius=radius_km * 1000,   # km → meters
+            radius=radius_nl_km * 1000,   # km → meters
             color="royalblue",
             fill =True,
             fill_opacity=0.04,
             weight=2,
-            tooltip=f"Radius {radius_km:.0f} km"
+            tooltip=f"NL radius {radius_nl_km:.0f} km"
         ).add_to(m)
+
+    if radius_de_km is not None and radius_de_km != radius_nl_km:
+        folium.Circle(
+            location=[o_lat, o_lon],
+            radius=radius_de_km * 1000,   # km → meters
+            color="darkorange",
+            fill =True,
+            fill_opacity=0.02, #0.04
+            weight=2,
+            tooltip=f"Duitsland radius {radius_de_km:.0f} km"
+        ).add_to(m)
+
 
     # Selected locations (red markers)
     for _, r in picked.iterrows():
@@ -332,15 +345,24 @@ def save_map_for_picked(picked: pd.DataFrame, o_lat: float, o_lon: float, out_ht
     <b>Legend</b><br>
     <span style="color: blue;">★</span> Parcel (origin)<br>
     <span style="color: red;">●</span> Selected zip code<br>
-    </div>
     """
+
+    if radius_nl_km is not None:
+        legend_html += '<span style="display:inline-block;width:14px;height:14px;border:2px solid royalblue;border-radius:50%;vertical-align:middle;"></span> NL radius<br>'
+
+    if radius_de_km is not None and radius_de_km != radius_nl_km:
+        legend_html += '<span style="display:inline-block;width:14px;height:14px;border:2px solid darkorange;border-radius:50%;vertical-align:middle;"></span> DE radius<br>'
+
+    legend_html += "</div>"
 
     m.get_root().html.add_child(folium.Element(legend_html))
     m.save("kaart.html") #str(out_html)
     print(f"\n[Info] Map saved to '{out_html}'. Open this file manually in your browser. (via download in codespace)")
 
 # ---------- Main flow ----------
-def run(perceelcode: str, radius_km: float, save_outputs: bool = False, include_german: bool = False):
+def run(perceelcode: str, radius_nl_km: float, radius_de_km: float | None = None, save_outputs: bool = False, include_german: bool = False):
+    if radius_de_km is None:
+        radius_de_km = radius_nl_km
     if not valideer_perceelcode(perceelcode):
         raise ValueError("Invalid parcel code format. Example: 'ABCD A 1234'.")
 
@@ -467,7 +489,24 @@ def run(perceelcode: str, radius_km: float, save_outputs: bool = False, include_
     df_geo = df.dropna(subset=["latitude", "longitude"]).copy()
     dists = haversine_km(o_lat, o_lon, df_geo["latitude"].values, df_geo["longitude"].values)
     df_geo["afstand_km"] = dists
-    in_range = df_geo.loc[df_geo["afstand_km"] <= radius_km].copy()
+    df_geo[kg_col] = pd.to_numeric(df_geo[kg_col], errors="coerce")
+
+    # German postcodes are only included if the tonnage is above 5,000 tons
+    df_geo["ton"] = df_geo[kg_col] / 1000
+
+    df_geo["radius_allowed_km"] = np.where(
+        df_geo["GEO_COUNTRY"].eq("DE"),
+        radius_de_km,
+        radius_nl_km
+    )
+
+    in_range = df_geo.loc[
+        (df_geo["afstand_km"] <= df_geo["radius_allowed_km"]) &
+        (
+            df_geo["GEO_COUNTRY"].ne("DE") |
+            (df_geo["ton"] > 1000)
+    )
+    ].copy()
 
     # 7) Aggregations
     # Sum loading locations per postcode key 
@@ -480,7 +519,7 @@ def run(perceelcode: str, radius_km: float, save_outputs: bool = False, include_
     )
 
     # >>> Largest locations within radius up to target (list with POSTCODE_KEY, tons, laadlocaties)
-    top_postcodes_tot_target(in_range, kg_col, laadlocatie_col, ROOT, group_key="POSTCODE_KEY", radius_km=radius_km, extra_cols=extra_cols)
+    top_postcodes_tot_target(in_range, kg_col, laadlocatie_col, ROOT, group_key="POSTCODE_KEY", radius_nl_km=radius_nl_km, radius_de_km=radius_de_km, extra_cols=extra_cols)
 
     # totals
     in_range[kg_col] = pd.to_numeric(in_range[kg_col], errors="coerce")
@@ -490,14 +529,18 @@ def run(perceelcode: str, radius_km: float, save_outputs: bool = False, include_
     summary = pd.DataFrame({
         "Origin":         [f"lat: {o_lat:.6f}, lon: {o_lon:.6f}"],
         "Parcel code":   [perceelcode],
-        "Radius_km":       [radius_km],
+        "Radius_NL_km":       [radius_nl_km],
+        "Radius_DE_km":       [radius_de_km],
         "Rows_in_range":    [len(in_range)],
         "Total_tons":      [total_ton],
         "Total_loadlocs": [total_laadlocaties],
     })
 
     # Console output
-    print(f"\nZip codes within {radius_km:.0f} km van lat: {o_lat:.5f}, lon: {o_lon:.5f}, perceel: {perceelcode}")
+    print(f"\nZip codes within radius from lat: {o_lat:.5f}, lon: {o_lon:.5f}, perceel: {perceelcode}")
+    print(f"Radius NL: {radius_nl_km:.0f} km")
+    if include_german:
+        print(f"Radius DE: {radius_de_km:.0f} km")
     print(f"Rows in range: {len(in_range)}")
     print(f"Total tons: {total_ton:,.2f}")
     print(f"Total loading locations: {total_laadlocaties}\n")
@@ -518,7 +561,20 @@ def run(perceelcode: str, radius_km: float, save_outputs: bool = False, include_
 # ---------- CLI ----------
 if __name__ == "__main__":
     perceel = input("Parcel code: ").strip().upper()
-    radius  = float(input("Radius in km: "))
-    inc_de = input("Include German zip codes? (y/n): ").strip().lower()
+    inc_de = input("Include German zip codes in the analysis? (y/n): ").strip().lower()
     include_german = inc_de in ["j", "ja", "y", "yes"]
-    run(perceel, radius, save_outputs=False, include_german=include_german)
+
+    if include_german:
+        separate_radii = input("Would you like to use separate radii for the Netherlands and Germany? (y/n): ").strip().lower()
+        use_separate_radii = separate_radii in ["y", "yes"]
+    else:
+        use_separate_radii = False
+
+    if use_separate_radii:
+        radius_nl = float(input("Radius for the Netherlands (km): "))
+        radius_de = float(input("Radius for Germany (km): "))
+    else:
+        radius_nl = float(input("Radius (km): "))
+        radius_de = radius_nl
+
+    run(perceel, radius_nl_km=radius_nl, radius_de_km=radius_de, save_outputs=False, include_german=include_german)
