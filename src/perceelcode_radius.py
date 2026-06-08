@@ -178,6 +178,83 @@ def top_postcodes_tot_target(in_range: pd.DataFrame, kg_col: str, laadlocatie_co
         extra_cols=extra_cols,
     )
 
+
+# --- Province filter via NL PC4 ranges (approximate) ---
+PROVINCE_PC4_RANGES = {
+    "Gelderland": [(6700, 6999), (7000, 7399), (3840, 3899), (8050, 8199), (4000, 4199)],
+    "Zuid-Holland": [(2200, 2399), (2500, 3399)],
+    "Noord-Holland": [(1000, 2199), (1900, 1999), (2400, 2499)],
+    "Utrecht": [(3400, 3999)],
+    "Overijssel": [(7400, 8199)],
+    "Noord-Brabant": [(4600, 5999)],
+    "Limburg": [(6000, 6599)],
+    "Zeeland": [(4300, 4599)],
+    "Friesland": [(8400, 9299)],
+    "Groningen": [(9300, 9999)],
+    "Drenthe": [(7700, 7999)],
+    "Flevoland": [(8200, 8399)],
+}
+
+def pc4_in_province(pc4: str, province: str) -> bool:
+    if not isinstance(pc4, str):
+        return False
+    pc4 = pc4.strip()
+    if not re.fullmatch(r"\d{4}", pc4):
+        return False
+    n = int(pc4)
+    for a, b in PROVINCE_PC4_RANGES.get(province, []):
+        if a <= n <= b:
+            return True
+    return False
+
+def province_totals_and_postcodes_by_range(
+    df_any: pd.DataFrame,
+    kg_col: str,
+    laadlocatie_col: str,
+    province_name: str,
+) -> tuple[pd.DataFrame, dict]:
+    df = df_any.copy()
+    df[kg_col] = pd.to_numeric(df[kg_col], errors="coerce")
+    df[laadlocatie_col] = pd.to_numeric(df[laadlocatie_col], errors="coerce")
+
+    # Only NL (ranges are NL PC4)
+    df = df[df["GEO_COUNTRY"].eq("NL")].copy()
+
+    # NL PC4 is GEO_KEY in your pipeline (string)
+    df["NL_PC4"] = df["GEO_KEY"].astype(str).str[:4]
+
+    df_prov = df[df["NL_PC4"].apply(lambda x: pc4_in_province(x, province_name))].copy()
+
+    if df_prov.empty:
+        return df_prov, {
+            "province": province_name,
+            "pc4_ranges": PROVINCE_PC4_RANGES.get(province_name, []),
+            "postcodes": 0,
+            "total_tons": 0.0,
+            "total_loading_locations": 0,
+        }
+
+    agg = (
+        df_prov.groupby("POSTCODE_KEY", as_index=False)
+        .agg(
+            kg_sum=(kg_col, "sum"),
+            loading_locations=(laadlocatie_col, "sum"),
+        )
+    )
+    agg["tons"] = agg["kg_sum"] / 1000.0
+    agg = agg.sort_values("tons", ascending=False).reset_index(drop=True)
+
+    summary = {
+        "province": province_name,
+        "pc4_ranges": PROVINCE_PC4_RANGES.get(province_name, []),
+        "postcodes": int(agg["POSTCODE_KEY"].nunique()),
+        "total_tons": float(agg["tons"].sum()),
+        "total_loading_locations": int(agg["loading_locations"].fillna(0).sum()),
+    }
+    return agg, summary
+
+
+
 # Create an interactive map with: blue star (parcel point) and red dots (selected POSTCODE_KEYs)
 def save_map_for_picked(picked: pd.DataFrame, o_lat: float, o_lon: float, out_html: Path, radius_km: float = None, extra_cols: list[str] = None):
     if picked.empty or {"latitude", "longitude"}.isdisjoint(picked.columns):
@@ -425,6 +502,17 @@ def run(perceelcode: str, radius_km: float, save_outputs: bool = False, include_
     print(f"Total tons: {total_ton:,.2f}")
     print(f"Total loading locations: {total_laadlocaties}\n")
     
+    prov = "Gelderland"  # of input("Provincie: ").strip()
+    prov_df, prov_summary = province_totals_and_postcodes_by_range(df_geo, kg_col, laadlocatie_col, prov)
+
+
+    print("\n=== Province summary ===")
+    print(prov_summary)
+
+    if not prov_df.empty:
+        print("\nTop postcodes in province:")
+        print(prov_df[["POSTCODE_KEY", "tons", "loading_locations"]].head(20).to_string(index=False))
+
     return in_range, summary
 
 # ---------- CLI ----------
