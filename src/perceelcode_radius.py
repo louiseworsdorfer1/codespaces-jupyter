@@ -19,7 +19,7 @@ o_lon_global = None
 def valideer_perceelcode(perceelcode: str) -> bool:
     # Validate a parcel code in the format:
     # 3-4 letters, space, 1 letter, space, 4 digits (e.g., ABCD A 1234)
-    patroon = r"^[A-Z]{3,4}\d{0,2}\s[A-Z]\s\d{1,5}$"
+    patroon = r"^[A-Z]{3,4}\d{0,2}\s[A-Z]{1,2}\s\d{1,5}$"
     return bool(re.match(patroon, perceelcode))
 
 def zoek_perceel_coordinaten(perceelcode: str) -> tuple[float, float]:
