@@ -6,3 +6,4 @@ requests
 pgeocode
 folium
 xlsxwriter
+openpyxl

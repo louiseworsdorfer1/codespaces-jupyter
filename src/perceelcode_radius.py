@@ -3,10 +3,8 @@ from pathlib import Path
 import pandas as pd
 import numpy as np
 import requests, re
-from math import radians, sin, cos, sqrt, atan2
 import pgeocode
 import folium
-from folium.plugins import FloatImage
 
 # ---------- Path to data ----------
 ROOT = Path(__file__).resolve().parents[1]
@@ -179,82 +177,6 @@ def top_postcodes_tot_target(in_range: pd.DataFrame, kg_col: str, laadlocatie_co
     )
 
 
-# --- Province filter via NL PC4 ranges (approximate) ---
-PROVINCE_PC4_RANGES = {
-    "Gelderland": [(6700, 6999), (7000, 7399), (3840, 3899), (8050, 8199), (4000, 4199)],
-    "Zuid-Holland": [(2200, 2399), (2500, 3399)],
-    "Noord-Holland": [(1000, 2199), (1900, 1999), (2400, 2499)],
-    "Utrecht": [(3400, 3999)],
-    "Overijssel": [(7400, 8199)],
-    "Noord-Brabant": [(4600, 5999)],
-    "Limburg": [(6000, 6599)],
-    "Zeeland": [(4300, 4599)],
-    "Friesland": [(8400, 9299)],
-    "Groningen": [(9300, 9999)],
-    "Drenthe": [(7700, 7999)],
-    "Flevoland": [(8200, 8399)],
-}
-
-def pc4_in_province(pc4: str, province: str) -> bool:
-    if not isinstance(pc4, str):
-        return False
-    pc4 = pc4.strip()
-    if not re.fullmatch(r"\d{4}", pc4):
-        return False
-    n = int(pc4)
-    for a, b in PROVINCE_PC4_RANGES.get(province, []):
-        if a <= n <= b:
-            return True
-    return False
-
-def province_totals_and_postcodes_by_range(
-    df_any: pd.DataFrame,
-    kg_col: str,
-    laadlocatie_col: str,
-    province_name: str,
-) -> tuple[pd.DataFrame, dict]:
-    df = df_any.copy()
-    df[kg_col] = pd.to_numeric(df[kg_col], errors="coerce")
-    df[laadlocatie_col] = pd.to_numeric(df[laadlocatie_col], errors="coerce")
-
-    # Only NL (ranges are NL PC4)
-    df = df[df["GEO_COUNTRY"].eq("NL")].copy()
-
-    # NL PC4 is GEO_KEY in your pipeline (string)
-    df["NL_PC4"] = df["GEO_KEY"].astype(str).str[:4]
-
-    df_prov = df[df["NL_PC4"].apply(lambda x: pc4_in_province(x, province_name))].copy()
-
-    if df_prov.empty:
-        return df_prov, {
-            "province": province_name,
-            "pc4_ranges": PROVINCE_PC4_RANGES.get(province_name, []),
-            "postcodes": 0,
-            "total_tons": 0.0,
-            "total_loading_locations": 0,
-        }
-
-    agg = (
-        df_prov.groupby("POSTCODE_KEY", as_index=False)
-        .agg(
-            kg_sum=(kg_col, "sum"),
-            loading_locations=(laadlocatie_col, "sum"),
-        )
-    )
-    agg["tons"] = agg["kg_sum"] / 1000.0
-    agg = agg.sort_values("tons", ascending=False).reset_index(drop=True)
-
-    summary = {
-        "province": province_name,
-        "pc4_ranges": PROVINCE_PC4_RANGES.get(province_name, []),
-        "postcodes": int(agg["POSTCODE_KEY"].nunique()),
-        "total_tons": float(agg["tons"].sum()),
-        "total_loading_locations": int(agg["loading_locations"].fillna(0).sum()),
-    }
-    return agg, summary
-
-
-
 # Create an interactive map with: blue star (parcel point) and red dots (selected POSTCODE_KEYs)
 def save_map_for_picked(picked: pd.DataFrame, o_lat: float, o_lon: float, out_html: Path, radius_km: float = None, extra_cols: list[str] = None):
     if picked.empty or {"latitude", "longitude"}.isdisjoint(picked.columns):
@@ -340,7 +262,7 @@ def save_map_for_picked(picked: pd.DataFrame, o_lat: float, o_lon: float, out_ht
     print(f"\n[Info] Map saved to '{out_html}'. Open this file manually in your browser. (via download in codespace)")
 
 # ---------- Main flow ----------
-def run(perceelcode: str, radius_km: float, save_outputs: bool = False, include_german: bool = False):
+def run(perceelcode: str, radius_km: float, include_german: bool = False, include_belgian: bool = False):
     if not valideer_perceelcode(perceelcode):
         raise ValueError("Invalid parcel code format. Example: 'ABCD A 1234'.")
 
@@ -353,11 +275,6 @@ def run(perceelcode: str, radius_km: float, save_outputs: bool = False, include_
     # 2) Load data
     df = pd.read_csv(CSV, sep=";")  
     df.columns = df.columns.str.strip()
-
-    # comma→dot for numeric-looking string columns
-    # for c in df.columns:
-    #     if df[c].dtype == object and df[c].astype(str).str.contains(",", na=False).any():
-    #         df[c] = pd.to_numeric(df[c].astype(str).str.replace(",", ".", regex=False), errors="coerce")
 
     for col in df.columns:
         if df[col].dtype == object:
@@ -387,8 +304,7 @@ def run(perceelcode: str, radius_km: float, save_outputs: bool = False, include_
     extra_cols = [c for c in candidate_extra_cols if c in df.columns]   
 
     # 4) Normalize postcodes and detect country/format
-    pc_raw_col = postcode_col  
-    df["PC_CLEAN"] = df[pc_raw_col].astype(str).apply(normalize_pc)
+    df["PC_CLEAN"] = df[postcode_col].astype(str).apply(normalize_pc)
     df["PC_TYPE"]  = df["PC_CLEAN"].apply(detect_country)  # NL6, BE, DE, of None
     df = df[df["PC_TYPE"].notna()].copy() 
 
@@ -418,8 +334,12 @@ def run(perceelcode: str, radius_km: float, save_outputs: bool = False, include_
                               np.nan)))
 
     # === Filter out German postcodes unless the user wants them ===
-    if not include_german:
-       df = df[df["GEO_COUNTRY"].ne("DE") | df["GEO_COUNTRY"].isna()].copy()
+    keep_mask = df["GEO_COUNTRY"].eq("NL")
+    if include_german:
+        keep_mask |= df["GEO_COUNTRY"].eq("DE")
+    if include_belgian:
+        keep_mask |= df["GEO_COUNTRY"].eq("BE")
+    df = df[keep_mask].copy()
 
     # 5) Coordinates per country via pgeocode
     nl_keys = sorted(df.loc[df["GEO_COUNTRY"].eq("NL"), "GEO_KEY"].dropna().unique().tolist())
@@ -486,34 +406,13 @@ def run(perceelcode: str, radius_km: float, save_outputs: bool = False, include_
     in_range[kg_col] = pd.to_numeric(in_range[kg_col], errors="coerce")
     total_ton = in_range[kg_col].sum() / 1000
 
-    # 8) Summary
-    summary = pd.DataFrame({
-        "Origin":         [f"lat: {o_lat:.6f}, lon: {o_lon:.6f}"],
-        "Parcel code":   [perceelcode],
-        "Radius_km":       [radius_km],
-        "Rows_in_range":    [len(in_range)],
-        "Total_tons":      [total_ton],
-        "Total_loadlocs": [total_laadlocaties],
-    })
-
     # Console output
     print(f"\nZip codes within {radius_km:.0f} km van lat: {o_lat:.5f}, lon: {o_lon:.5f}, perceel: {perceelcode}")
     print(f"Rows in range: {len(in_range)}")
     print(f"Total tons: {total_ton:,.2f}")
     print(f"Total loading locations: {total_laadlocaties}\n")
     
-    prov = "Gelderland"  # of input("Provincie: ").strip()
-    prov_df, prov_summary = province_totals_and_postcodes_by_range(df_geo, kg_col, laadlocatie_col, prov)
-
-
-    print("\n=== Province summary ===")
-    print(prov_summary)
-
-    if not prov_df.empty:
-        print("\nTop postcodes in province:")
-        print(prov_df[["POSTCODE_KEY", "tons", "loading_locations"]].head(20).to_string(index=False))
-
-    return in_range, summary
+    return in_range
 
 # ---------- CLI ----------
 if __name__ == "__main__":
@@ -521,4 +420,6 @@ if __name__ == "__main__":
     radius  = float(input("Radius in km: "))
     inc_de = input("Include German zip codes? (y/n): ").strip().lower()
     include_german = inc_de in ["j", "ja", "y", "yes"]
-    run(perceel, radius, save_outputs=False, include_german=include_german)
+    inc_be = input("Include Belgian zip codes? (y/n): ").strip().lower()
+    include_belgian = inc_be in ["j", "ja", "y", "yes"]
+    run(perceel, radius, include_german=include_german, include_belgian=include_belgian)
